@@ -8,11 +8,8 @@ const __dirname = path.dirname(__filename);
 
 const SMARTCTL_PATH = path.join(__dirname, "bin", "smartctl.exe");
 const SERVER_PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
-const POLL_INTERVAL_MS = 5000; // update every 5 seconds
 
-let drivesCache = []; // stores latest drive summaries
-
-// Run smartctl
+// Execute smartctl with given arguments
 function runSmartctl(args) {
 	return new Promise((resolve, reject) => {
 		execFile(SMARTCTL_PATH, args, { windowsHide: true }, (error, stdout, stderr) => {
@@ -22,14 +19,38 @@ function runSmartctl(args) {
 	});
 }
 
-// Scan connected drives
+// Execute WMIC for logical disk space
+function getDiskSpace() {
+	return new Promise((resolve, reject) => {
+		execFile("wmic", ["logicaldisk", "get", "deviceid,size,freespace", "/format:csv"], { windowsHide: true }, (error, stdout) => {
+			if (error) return resolve([]);
+			const lines = stdout.trim().split(/\r?\n/).slice(1); // skip header
+			const volumes = [];
+			for (const line of lines) {
+				const parts = line.split(",");
+				if (parts.length < 4) continue;
+				const [, deviceId, freeStr, sizeStr] = parts;
+				const free = Number(freeStr);
+				const size = Number(sizeStr);
+				if (!Number.isFinite(free) || !Number.isFinite(size) || size === 0) continue;
+				const freeGB = +(free / 1024 ** 3).toFixed(2);
+				const usedGB = +((size - free) / 1024 ** 3).toFixed(2);
+				const usagePercent = +((usedGB / (size / 1024 ** 3)) * 100).toFixed(1);
+				volumes.push({ DriveLetter: deviceId, FreeGB: freeGB, UsedGB: usedGB, UsagePercent: usagePercent });
+			}
+			resolve(volumes);
+		});
+	});
+}
+
+// Scan all devices
 async function scanDevices() {
 	const { stdout } = await runSmartctl(["--scan", "-j"]);
 	const parsed = JSON.parse(stdout || "{}");
 	return Array.isArray(parsed.devices) ? parsed.devices : [];
 }
 
-// Read SMART for a device
+// Read SMART info for a single device
 async function readSmartForDevice(name) {
 	const argSets = [
 		["-a", "-j", name],
@@ -53,7 +74,7 @@ function toNumberSafe(value, fallback = 0) {
 	return Number.isFinite(n) ? n : fallback;
 }
 
-// Summarize SMART
+// Summarize SMART data
 function summarizeSmart(json, deviceName) {
 	const type = json?.device?.type || "unknown";
 	const model = json?.model_name ?? json?.model_family ?? "";
@@ -111,27 +132,28 @@ function summarizeSmart(json, deviceName) {
 	};
 }
 
-// Update the drivesCache every POLL_INTERVAL_MS
-async function pollDrives() {
-	const devices = await scanDevices();
+// Get summaries for all drives + disk space
+// Get summaries for all drives + disk space
+async function getAllDriveSummaries() {
+	const [devices, volumes] = await Promise.all([scanDevices(), getDiskSpace()]);
 	const summaries = [];
+
 	for (const d of devices) {
 		const name = d?.name;
 		if (!name) continue;
 		try {
 			const j = await readSmartForDevice(name);
 			if (!j || (!j.model_name && !j.serial_number && !j.smart_status && !j?.device?.type)) continue;
-			summaries.push(summarizeSmart(j, name));
+			const summary = summarizeSmart(j, name);
+			summaries.push(summary);
 		} catch (e) {
 			summaries.push({ Device: name, error: true, message: String(e?.error?.message || e?.message || e) });
 		}
 	}
-	drivesCache = summaries.sort((a, b) => String(a.Device).localeCompare(String(b.Device)));
+
+	return { Drives: summaries.sort((a, b) => String(a.Device).localeCompare(String(b.Device))), Volumes: volumes };
 }
 
-// Start periodic polling
-pollDrives(); // initial poll
-setInterval(pollDrives, POLL_INTERVAL_MS);
 
 // Send JSON response
 function sendJson(res, status, body) {
@@ -145,7 +167,7 @@ function sendJson(res, status, body) {
 }
 
 // HTTP server
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
 	res.setHeader("Access-Control-Allow-Origin", "*");
 	res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
 	res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -156,7 +178,12 @@ const server = http.createServer((req, res) => {
 	}
 
 	if (req.method === "GET" && (req.url === "/" || req.url === "/api/drives")) {
-		return sendJson(res, 200, drivesCache);
+		try {
+			const summaries = await getAllDriveSummaries();
+			return sendJson(res, 200, summaries);
+		} catch (e) {
+			return sendJson(res, 500, { error: true, message: String(e?.message || e) });
+		}
 	}
 
 	res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
