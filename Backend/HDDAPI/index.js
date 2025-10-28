@@ -8,26 +8,29 @@ const __dirname = path.dirname(__filename);
 
 const SMARTCTL_PATH = path.join(__dirname, "bin", "smartctl.exe");
 const SERVER_PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+const POLL_INTERVAL_MS = 5000; // update every 5 seconds
 
+let drivesCache = []; // stores latest drive summaries
+
+// Run smartctl
 function runSmartctl(args) {
 	return new Promise((resolve, reject) => {
 		execFile(SMARTCTL_PATH, args, { windowsHide: true }, (error, stdout, stderr) => {
-			if (error) {
-				return reject(Object.assign(new Error("smartctl failed"), { error, stdout, stderr }));
-			}
+			if (error) return reject(Object.assign(new Error("smartctl failed"), { error, stdout, stderr }));
 			resolve({ stdout, stderr });
 		});
 	});
 }
 
+// Scan connected drives
 async function scanDevices() {
 	const { stdout } = await runSmartctl(["--scan", "-j"]);
 	const parsed = JSON.parse(stdout || "{}");
 	return Array.isArray(parsed.devices) ? parsed.devices : [];
 }
 
+// Read SMART for a device
 async function readSmartForDevice(name) {
-	// Try plain first, then hints commonly needed for USB bridges/enclosures
 	const argSets = [
 		["-a", "-j", name],
 		["-a", "-j", "-d", "sat", name],
@@ -38,21 +41,19 @@ async function readSmartForDevice(name) {
 		try {
 			const { stdout } = await runSmartctl(args);
 			const parsed = JSON.parse(stdout || "{}");
-			if (parsed && (parsed.model_name || parsed.serial_number || parsed?.device?.type)) {
-				return parsed;
-			}
-		} catch (_) {
-			// try next
-		}
+			if (parsed && (parsed.model_name || parsed.serial_number || parsed?.device?.type)) return parsed;
+		} catch (_) { /* try next */ }
 	}
 	return {};
 }
 
+// Safe number conversion
 function toNumberSafe(value, fallback = 0) {
 	const n = Number(value);
 	return Number.isFinite(n) ? n : fallback;
 }
 
+// Summarize SMART
 function summarizeSmart(json, deviceName) {
 	const type = json?.device?.type || "unknown";
 	const model = json?.model_name ?? json?.model_family ?? "";
@@ -61,29 +62,25 @@ function summarizeSmart(json, deviceName) {
 
 	let writtenGB = 0;
 	let healthPercent = undefined;
+	let liveTempC = undefined;
 
 	if (type === "nvme") {
-		const duw = toNumberSafe(json?.nvme_smart_health_information_log?.data_units_written, 0);
-		// NVMe spec: one data unit = 512,000 bytes
-		writtenGB = Math.round(((duw * 512000) / (1024 * 1024 * 1024)) * 100) / 100;
-		const used = toNumberSafe(json?.nvme_smart_health_information_log?.percentage_used, 0);
-		healthPercent = Math.max(0, 100 - used);
+		const log = json?.nvme_smart_health_information_log || {};
+		writtenGB = Math.round(((toNumberSafe(log.data_units_written) * 512000) / (1024 ** 3)) * 100) / 100;
+		healthPercent = Math.max(0, 100 - toNumberSafe(log.percentage_used));
+		liveTempC = log.composite_temperature ? log.composite_temperature - 273 : undefined;
 	} else {
 		const attrs = json?.ata_smart_attributes?.table || [];
-		// Total LBAs Written usually attribute 241/242
 		const lbasAttr = attrs.find(a => (a?.id === 241 || a?.id === 242) && /Written/i.test(a?.name || ""));
-		const lbas = toNumberSafe(lbasAttr?.raw?.value, 0);
-		writtenGB = Math.round(((lbas * 512) / (1024 * 1024 * 1024)) * 100) / 100;
+		writtenGB = Math.round(((toNumberSafe(lbasAttr?.raw?.value) * 512) / (1024 ** 3)) * 100) / 100;
 
-		// Health/life left often in attributes 231, 202, 177 or name matches
 		const lifeAttr = attrs.find(a => a && (a.id === 231 || a.id === 202 || a.id === 177 || /Wear|Life|Percent/i.test(a.name || "")));
-		if (lifeAttr && Number.isFinite(Number(lifeAttr.value))) {
-			healthPercent = Number(lifeAttr.value);
-		} else if (json?.smart_status?.passed === true) {
-			healthPercent = 100;
-		} else if (json?.smart_status?.passed === false) {
-			healthPercent = 0;
-		}
+		if (lifeAttr && Number.isFinite(Number(lifeAttr.value))) healthPercent = Number(lifeAttr.value);
+		else if (json?.smart_status?.passed === true) healthPercent = 100;
+		else if (json?.smart_status?.passed === false) healthPercent = 0;
+
+		const tempAttr = attrs.find(a => a?.id === 194);
+		if (tempAttr) liveTempC = Number(tempAttr.raw?.value);
 	}
 
 	return {
@@ -92,12 +89,30 @@ function summarizeSmart(json, deviceName) {
 		Model: model,
 		Serial: serial,
 		HealthPercent: healthPercent,
+		WrittenGB: writtenGB,
+		PowerCycles: toNumberSafe(json?.power_cycle_count),
 		PowerOnHours: hours,
-		WrittenGB: writtenGB
+		UnsafeShutdowns: toNumberSafe(json?.unsafe_shutdowns),
+		DataUnitsRead: toNumberSafe(json?.nvme_smart_health_information_log?.data_units_read || 0),
+		DataUnitsWritten: toNumberSafe(json?.nvme_smart_health_information_log?.data_units_written || 0),
+		HostReadCommands: toNumberSafe(json?.nvme_smart_health_information_log?.host_reads || 0),
+		HostWriteCommands: toNumberSafe(json?.nvme_smart_health_information_log?.host_writes || 0),
+		ControllerBusyTimeMinutes: toNumberSafe(json?.nvme_smart_health_information_log?.controller_busy_time || 0),
+		MediaDataIntegrityErrors: toNumberSafe(json?.media_and_data_integrity_errors),
+		ErrorLogEntries: toNumberSafe(json?.number_of_error_information_log_entries),
+		CompositeTemperatureK: json?.nvme_smart_health_information_log?.composite_temperature,
+		LiveTemperatureC: liveTempC,
+		CriticalWarning: json?.nvme_smart_health_information_log?.critical_warning || 0,
+		AvailableSparePercent: toNumberSafe(json?.nvme_smart_health_information_log?.available_spare, 0),
+		AvailableSpareThreshold: toNumberSafe(json?.nvme_smart_health_information_log?.available_spare_threshold, 0),
+		PercentageUsed: toNumberSafe(json?.nvme_smart_health_information_log?.percentage_used, 0),
+		WarningTempTimeMinutes: toNumberSafe(json?.nvme_smart_health_information_log?.warning_composite_temperature_time, 0),
+		CriticalTempTimeMinutes: toNumberSafe(json?.nvme_smart_health_information_log?.critical_composite_temperature_time, 0)
 	};
 }
 
-async function getAllDriveSummaries() {
+// Update the drivesCache every POLL_INTERVAL_MS
+async function pollDrives() {
 	const devices = await scanDevices();
 	const summaries = [];
 	for (const d of devices) {
@@ -105,18 +120,20 @@ async function getAllDriveSummaries() {
 		if (!name) continue;
 		try {
 			const j = await readSmartForDevice(name);
-			if (!j || (!j.model_name && !j.serial_number && !j.smart_status && !j?.device?.type)) {
-				// skip meaningless/empty entries often seen with some USB bridges
-				continue;
-			}
+			if (!j || (!j.model_name && !j.serial_number && !j.smart_status && !j?.device?.type)) continue;
 			summaries.push(summarizeSmart(j, name));
 		} catch (e) {
 			summaries.push({ Device: name, error: true, message: String(e?.error?.message || e?.message || e) });
 		}
 	}
-	return summaries.sort((a, b) => String(a.Device).localeCompare(String(b.Device)));
+	drivesCache = summaries.sort((a, b) => String(a.Device).localeCompare(String(b.Device)));
 }
 
+// Start periodic polling
+pollDrives(); // initial poll
+setInterval(pollDrives, POLL_INTERVAL_MS);
+
+// Send JSON response
 function sendJson(res, status, body) {
 	const data = Buffer.from(JSON.stringify(body));
 	res.writeHead(status, {
@@ -127,20 +144,19 @@ function sendJson(res, status, body) {
 	res.end(data);
 }
 
-const server = http.createServer(async (req, res) => {
-	// Simple CORS for local use
+// HTTP server
+const server = http.createServer((req, res) => {
 	res.setHeader("Access-Control-Allow-Origin", "*");
 	res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
 	res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-	if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
+
+	if (req.method === "OPTIONS") {
+		res.writeHead(204);
+		return res.end();
+	}
 
 	if (req.method === "GET" && (req.url === "/" || req.url === "/api/drives")) {
-		try {
-			const summaries = await getAllDriveSummaries();
-			return sendJson(res, 200, summaries);
-		} catch (e) {
-			return sendJson(res, 500, { error: true, message: String(e?.message || e) });
-		}
+		return sendJson(res, 200, drivesCache);
 	}
 
 	res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
@@ -150,5 +166,3 @@ const server = http.createServer(async (req, res) => {
 server.listen(SERVER_PORT, () => {
 	console.log(`HDDAPI listening on http://localhost:${SERVER_PORT} (GET /api/drives)`);
 });
-
-
