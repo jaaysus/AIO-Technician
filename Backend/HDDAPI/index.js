@@ -76,6 +76,41 @@ function toNumberSafe(value, fallback = 0) {
 
 // Summarize SMART data
 function summarizeSmart(json, deviceName) {
+	function extractTemperatureC() {
+		const type = json?.device?.type || "unknown";
+		// Prefer common top-level temperature objects when available
+		const topTemp = json?.temperature;
+		if (topTemp && Number.isFinite(Number(topTemp.current))) {
+			return Number(topTemp.current);
+		}
+
+		if (type === "nvme") {
+			const log = json?.nvme_smart_health_information_log || {};
+			// composite_temperature is Kelvin in smartctl output
+			if (Number.isFinite(Number(log.composite_temperature))) {
+				return Math.round((Number(log.composite_temperature) - 273));
+			}
+			// some devices expose temperature_sensors as array of Kelvin values
+			if (Array.isArray(log.temperature_sensors) && Number.isFinite(Number(log.temperature_sensors[0]))) {
+				return Math.round((Number(log.temperature_sensors[0]) - 273));
+			}
+		}
+
+		// ATA/SAT often provides attribute 194 or 190, and sometimes raw strings
+		const attrs = json?.ata_smart_attributes?.table || [];
+		const byId = (id) => attrs.find(a => a?.id === id);
+		const a194 = byId(194);
+		const a190 = byId(190);
+		const candidates = [a194?.raw?.value, a194?.raw?.string, a190?.raw?.value, a190?.raw?.string];
+		for (const c of candidates) {
+			if (c == null) continue;
+			const num = parseInt(String(c).match(/-?\d+/)?.[0] ?? "", 10);
+			if (Number.isFinite(num)) return num;
+		}
+
+		// SCSI may expose json.temperature.current as well (handled above)
+		return undefined;
+	}
 	const type = json?.device?.type || "unknown";
 	const model = json?.model_name ?? json?.model_family ?? "";
 	const serial = json?.serial_number ?? "";
@@ -83,13 +118,16 @@ function summarizeSmart(json, deviceName) {
 
 	let writtenGB = 0;
 	let healthPercent = undefined;
-	let liveTempC = undefined;
+	let liveTempC = extractTemperatureC();
 
 	if (type === "nvme") {
 		const log = json?.nvme_smart_health_information_log || {};
 		writtenGB = Math.round(((toNumberSafe(log.data_units_written) * 512000) / (1024 ** 3)) * 100) / 100;
 		healthPercent = Math.max(0, 100 - toNumberSafe(log.percentage_used));
-		liveTempC = log.composite_temperature ? log.composite_temperature - 273 : undefined;
+		// temperature handled by extractor; keep for backward safety if extractor failed
+		if (liveTempC == null && Number.isFinite(Number(log.composite_temperature))) {
+			liveTempC = Math.round((Number(log.composite_temperature) - 273));
+		}
 	} else {
 		const attrs = json?.ata_smart_attributes?.table || [];
 		const lbasAttr = attrs.find(a => (a?.id === 241 || a?.id === 242) && /Written/i.test(a?.name || ""));
@@ -100,8 +138,13 @@ function summarizeSmart(json, deviceName) {
 		else if (json?.smart_status?.passed === true) healthPercent = 100;
 		else if (json?.smart_status?.passed === false) healthPercent = 0;
 
-		const tempAttr = attrs.find(a => a?.id === 194);
-		if (tempAttr) liveTempC = Number(tempAttr.raw?.value);
+		// temperature handled by extractor; keep for backward safety if extractor failed
+		if (liveTempC == null) {
+			const tempAttr = attrs.find(a => a?.id === 194 || a?.id === 190);
+			const raw = tempAttr?.raw?.value ?? tempAttr?.raw?.string;
+			const parsed = raw != null ? parseInt(String(raw).match(/-?\d+/)?.[0] ?? "", 10) : undefined;
+			if (Number.isFinite(parsed)) liveTempC = parsed;
+		}
 	}
 
 	return {
@@ -123,6 +166,7 @@ function summarizeSmart(json, deviceName) {
 		ErrorLogEntries: toNumberSafe(json?.number_of_error_information_log_entries),
 		CompositeTemperatureK: json?.nvme_smart_health_information_log?.composite_temperature,
 		LiveTemperatureC: liveTempC,
+		TemperatureC: liveTempC,
 		CriticalWarning: json?.nvme_smart_health_information_log?.critical_warning || 0,
 		AvailableSparePercent: toNumberSafe(json?.nvme_smart_health_information_log?.available_spare, 0),
 		AvailableSpareThreshold: toNumberSafe(json?.nvme_smart_health_information_log?.available_spare_threshold, 0),
@@ -175,6 +219,52 @@ const server = http.createServer(async (req, res) => {
 	if (req.method === "OPTIONS") {
 		res.writeHead(204);
 		return res.end();
+	}
+
+	// Server-Sent Events stream for periodic updates
+	if (req.method === "GET" && req.url && req.url.startsWith("/api/drives/stream")) {
+		// parse interval from query (?interval=seconds)
+		let intervalMs = 10000;
+		try {
+			const idx = req.url.indexOf("?");
+			if (idx !== -1) {
+				const query = new URLSearchParams(req.url.slice(idx + 1));
+				const seconds = Number(query.get("interval"));
+				if (Number.isFinite(seconds) && seconds > 0) intervalMs = Math.floor(seconds * 1000);
+			}
+		} catch (_) {}
+
+		res.writeHead(200, {
+			"Content-Type": "text/event-stream",
+			"Cache-Control": "no-store",
+			"Connection": "keep-alive",
+			"Access-Control-Allow-Origin": "*"
+		});
+
+		let closed = false;
+		const sendEvent = async () => {
+			if (closed) return;
+			try {
+				const payload = await getAllDriveSummaries();
+				res.write(`data: ${JSON.stringify(payload)}\n\n`);
+			} catch (e) {
+				res.write(`event: error\n`);
+				res.write(`data: ${JSON.stringify({ error: true, message: String(e?.message || e) })}\n\n`);
+			}
+		};
+
+		// send immediately, then on interval
+		sendEvent();
+		const timer = setInterval(sendEvent, intervalMs);
+		const cleanup = () => {
+			if (closed) return;
+			closed = true;
+			clearInterval(timer);
+			try { res.end(); } catch (_) {}
+		};
+		req.on("close", cleanup);
+		req.on("end", cleanup);
+		return;
 	}
 
 	if (req.method === "GET" && (req.url === "/" || req.url === "/api/drives")) {
