@@ -22,21 +22,32 @@ function runSmartctl(args) {
 // Execute WMIC for logical disk space
 function getDiskSpace() {
 	return new Promise((resolve, reject) => {
-		execFile("wmic", ["logicaldisk", "get", "deviceid,size,freespace", "/format:csv"], { windowsHide: true }, (error, stdout) => {
+		execFile("wmic", ["logicaldisk", "get", "deviceid,size,freespace,volumename", "/format:csv"], { windowsHide: true }, (error, stdout) => {
 			if (error) return resolve([]);
-			const lines = stdout.trim().split(/\r?\n/).slice(1); // skip header
+			const rows = stdout.trim().split(/\r?\n/).filter(Boolean);
+			if (rows.length < 2) return resolve([]);
+			const header = rows[0].split(",").map(h => h.trim().toLowerCase());
+			const idx = {
+				deviceid: header.indexOf("deviceid"),
+				freespace: header.indexOf("freespace"),
+				size: header.indexOf("size"),
+				volumename: header.indexOf("volumename")
+			};
 			const volumes = [];
-			for (const line of lines) {
+			for (const line of rows.slice(1)) {
 				const parts = line.split(",");
-				if (parts.length < 4) continue;
-				const [, deviceId, freeStr, sizeStr] = parts;
+				if (parts.length < header.length) continue;
+				const deviceId = idx.deviceid >= 0 ? parts[idx.deviceid] : undefined;
+				const freeStr = idx.freespace >= 0 ? parts[idx.freespace] : undefined;
+				const sizeStr = idx.size >= 0 ? parts[idx.size] : undefined;
+				const volumeName = idx.volumename >= 0 ? parts[idx.volumename] : "";
 				const free = Number(freeStr);
 				const size = Number(sizeStr);
 				if (!Number.isFinite(free) || !Number.isFinite(size) || size === 0) continue;
 				const freeGB = +(free / 1024 ** 3).toFixed(2);
 				const usedGB = +((size - free) / 1024 ** 3).toFixed(2);
 				const usagePercent = +((usedGB / (size / 1024 ** 3)) * 100).toFixed(1);
-				volumes.push({ DriveLetter: deviceId, FreeGB: freeGB, UsedGB: usedGB, UsagePercent: usagePercent });
+				volumes.push({ DriveLetter: deviceId, VolumeName: volumeName || "", FreeGB: freeGB, UsedGB: usedGB, UsagePercent: usagePercent });
 			}
 			resolve(volumes);
 		});
@@ -198,6 +209,27 @@ async function getAllDriveSummaries() {
 	return { Drives: summaries.sort((a, b) => String(a.Device).localeCompare(String(b.Device))), Volumes: volumes };
 }
 
+// Get summaries for all drives only (no volumes)
+async function getDriveSummariesOnly() {
+	const devices = await scanDevices();
+	const summaries = [];
+
+	for (const d of devices) {
+		const name = d?.name;
+		if (!name) continue;
+		try {
+			const j = await readSmartForDevice(name);
+			if (!j || (!j.model_name && !j.serial_number && !j.smart_status && !j?.device?.type)) continue;
+			const summary = summarizeSmart(j, name);
+			summaries.push(summary);
+		} catch (e) {
+			summaries.push({ Device: name, error: true, message: String(e?.error?.message || e?.message || e) });
+		}
+	}
+
+	return { Drives: summaries.sort((a, b) => String(a.Device).localeCompare(String(b.Device))) };
+}
+
 
 // Send JSON response
 function sendJson(res, status, body) {
@@ -246,7 +278,7 @@ const server = http.createServer(async (req, res) => {
 			if (closed) return;
 			try {
 				const payload = await getAllDriveSummaries();
-				res.write(`data: ${JSON.stringify(payload)}\n\n`);
+				res.write(`data: ${JSON.stringify({ Drives: payload.Drives })}\n\n`);
 			} catch (e) {
 				res.write(`event: error\n`);
 				res.write(`data: ${JSON.stringify({ error: true, message: String(e?.message || e) })}\n\n`);
@@ -269,8 +301,17 @@ const server = http.createServer(async (req, res) => {
 
 	if (req.method === "GET" && (req.url === "/" || req.url === "/api/drives")) {
 		try {
-			const summaries = await getAllDriveSummaries();
-			return sendJson(res, 200, summaries);
+			const summaries = await getDriveSummariesOnly();
+			return sendJson(res, 200, { Drives: summaries.Drives });
+		} catch (e) {
+			return sendJson(res, 500, { error: true, message: String(e?.message || e) });
+		}
+	}
+
+	if (req.method === "GET" && req.url && req.url.startsWith("/api/drives/volumes")) {
+		try {
+			const volumes = await getDiskSpace();
+			return sendJson(res, 200, { Volumes: volumes });
 		} catch (e) {
 			return sendJson(res, 500, { error: true, message: String(e?.message || e) });
 		}
