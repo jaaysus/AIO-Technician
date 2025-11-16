@@ -7,7 +7,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const SMARTCTL_PATH = path.join(__dirname, "bin", "smartctl.exe");
-const SERVER_PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+const SERVER_PORT = process.env.PORT ? Number(process.env.PORT) : 54321;
 
 // Execute smartctl with given arguments
 function runSmartctl(args) {
